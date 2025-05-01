@@ -1,11 +1,11 @@
 """
-FastAPI OpenAI Chatbot Application with Session Management
+FastAPI OpenAI Multi-Agent Chatbot Application
 
-This is a minimal FastAPI application that implements a chatbot using the OpenAI SDK.
+This is a FastAPI application that implements a multi-agent chatbot system using the OpenAI SDK.
 Features:
-- Simple chat endpoint that accepts text messages and returns AI responses
-- Session management to maintain conversation history
-- Proper handling of system, user, and assistant roles
+- Router agent that directs queries to specialized agents
+- Specialized agents for different tasks (writing and math)
+- Session management with proper role handling
 - Basic HTML interface for user interaction
 - Uses OpenAI's API for generating responses
 """
@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Initialize FastAPI app
-app = FastAPI(title="OpenAI Chatbot")
+app = FastAPI(title="OpenAI Multi-Agent Chatbot")
 
 # Initialize templates
 templates = Jinja2Templates(directory="templates")
@@ -36,9 +36,6 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Default system message
-DEFAULT_SYSTEM_MESSAGE = "You are a helpful, friendly, and knowledgeable assistant. You provide clear, concise, and accurate information to the user's questions."
 
 
 # Create Pydantic models for request/response validation
@@ -52,7 +49,7 @@ class Message(BaseModel):
 class ChatSession(BaseModel):
     session_id: str
     messages: List[Message] = Field(default_factory=list)
-    system_message: str = DEFAULT_SYSTEM_MESSAGE
+    current_agent: str = "Router"
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
@@ -60,41 +57,113 @@ class ChatSession(BaseModel):
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     message: str
-    system_message: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     session_id: str
     response: str
+    agent: str
 
+
+class AgentMetadata(BaseModel):
+    name: str
+    description: str
+    system_prompt: str
+
+
+# Define our agents with system prompts
+class Agent:
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        system_prompt: str,
+        model: str = "gpt-3.5-turbo",
+    ):
+        self.name = name
+        self.description = description
+        self.system_prompt = system_prompt
+        self.model = model
+
+    def get_metadata(self) -> AgentMetadata:
+        return AgentMetadata(
+            name=self.name,
+            description=self.description,
+            system_prompt=self.system_prompt,
+        )
+
+    async def process(self, messages: List[Message]) -> str:
+        # Format messages for OpenAI API
+        # Start with the system prompt
+        formatted_messages = [{"role": "system", "content": self.system_prompt}]
+
+        # Add the conversation history
+        for msg in messages:
+            if msg.role != "system":  # Skip any system messages in the history
+                formatted_messages.append({"role": msg.role, "content": msg.content})
+
+        # Call OpenAI API
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=formatted_messages,
+            max_tokens=500,
+            temperature=0.7,
+        )
+
+        return response.choices[0].message.content
+
+
+# Define our specialized agents
+writing_agent = Agent(
+    name="WritingAssistant",
+    description="Helps with writing tasks, including drafting, editing, and creative writing.",
+    system_prompt="You are a skilled writing assistant. You excel at helping users with drafting, editing, and creative writing tasks. Your responses should be well-structured, clear, and tailored to the writing needs of the user.",
+)
+
+math_agent = Agent(
+    name="MathExpert",
+    description="Helps with mathematical problems and explanations.",
+    system_prompt="You are a math expert. You excel at solving mathematical problems and providing clear explanations of mathematical concepts. Show your work step by step and explain your reasoning clearly.",
+)
+
+# Router agent to determine which specialized agent to use
+router_agent = Agent(
+    name="Router",
+    description="Analyzes queries and routes them to the appropriate specialized agent.",
+    system_prompt="""You are a router agent that analyzes user queries and decides which specialized agent should handle the response.
+
+For each user message, you must determine the most appropriate agent from the following options:
+1. WritingAssistant - For writing tasks, drafting, editing, creative writing, etc.
+2. MathExpert - For mathematical problems, equations, calculations, etc.
+
+Respond with ONLY the name of the agent to use (WritingAssistant or MathExpert).
+If the query could be handled by either agent, choose the one that seems most appropriate.
+""",
+)
+
+# Dictionary to store our agents
+agents = {
+    "WritingAssistant": writing_agent,
+    "MathExpert": math_agent,
+    "Router": router_agent,
+}
 
 # In-memory storage for chat sessions
-# In a production app, you would use a database
 chat_sessions: Dict[str, ChatSession] = {}
 
 
-def get_or_create_session(
-    session_id: Optional[str] = None, system_message: Optional[str] = None
-) -> ChatSession:
+def get_or_create_session(session_id: Optional[str] = None) -> ChatSession:
     """
     Get an existing session or create a new one if it doesn't exist
     """
     if session_id and session_id in chat_sessions:
         session = chat_sessions[session_id]
         session.updated_at = datetime.now()
-
-        # Update system message if provided
-        if system_message:
-            session.system_message = system_message
-
         return session
 
     # Create a new session
     new_session_id = session_id or str(uuid.uuid4())
-    new_session = ChatSession(
-        session_id=new_session_id,
-        system_message=system_message or DEFAULT_SYSTEM_MESSAGE,
-    )
+    new_session = ChatSession(session_id=new_session_id)
     chat_sessions[new_session_id] = new_session
     return new_session
 
@@ -108,53 +177,66 @@ async def get_chat_page(request: Request):
     return templates.TemplateResponse("chat.html", {"request": request})
 
 
+@app.get("/agents", response_model=Dict[str, AgentMetadata])
+async def get_agents():
+    """
+    Returns metadata about available agents
+    """
+    return {name: agent.get_metadata() for name, agent in agents.items()}
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(chat_request: ChatRequest):
     """
-    Process a chat message and return AI response
+    Process chat messages using a multi-agent system and return AI response
     """
     try:
         # Get or create a session
-        session = get_or_create_session(
-            chat_request.session_id, chat_request.system_message
-        )
+        session = get_or_create_session(chat_request.session_id)
 
         # Add user message to session
         user_message = Message(role="user", content=chat_request.message)
         session.messages.append(user_message)
 
-        # Format messages for OpenAI API
-        # Start with the system message
-        formatted_messages = [{"role": "system", "content": session.system_message}]
+        # First, use the router agent to determine which specialized agent to use
+        router_messages = [Message(role="user", content=chat_request.message)]
+        router_response = await router_agent.process(router_messages)
 
-        # Add the conversation history
-        for msg in session.messages:
-            formatted_messages.append({"role": msg.role, "content": msg.content})
+        # Clean up the response to ensurxe it's just the agent name
+        selected_agent_name = router_response.strip().split("\n")[0]
 
-        # Call OpenAI API
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=formatted_messages,
-            max_tokens=500,
-            temperature=0.7,
-        )
+        # Default to WritingAssistant if the router's response doesn't match an agent
+        if selected_agent_name not in agents or selected_agent_name == "Router":
+            selected_agent_name = "WritingAssistant"
 
-        # Extract the response
-        assistant_response = response.choices[0].message.content
+        # Update the current agent in the session
+        session.current_agent = selected_agent_name
+
+        # Get the selected agent
+        selected_agent = agents[selected_agent_name]
+
+        # Process the messages with the selected agent
+        agent_response = await selected_agent.process(session.messages)
 
         # Add assistant message to session
-        assistant_message = Message(role="assistant", content=assistant_response)
+        assistant_message = Message(role="assistant", content=agent_response)
         session.messages.append(assistant_message)
 
         # Update session
         session.updated_at = datetime.now()
         chat_sessions[session.session_id] = session
 
-        # Return the response
-        return ChatResponse(session_id=session.session_id, response=assistant_response)
+        # Return the response along with the agent that generated it
+        return ChatResponse(
+            session_id=session.session_id,
+            response=agent_response,
+            agent=selected_agent_name,
+        )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error processing message: {str(e)}"
+        )
 
 
 @app.get("/sessions/{session_id}", response_model=ChatSession)
